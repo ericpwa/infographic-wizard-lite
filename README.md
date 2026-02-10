@@ -9,6 +9,8 @@
 
 Social media folks and marketers, here’s the hack to dip out early: Infographic Wizard — Lite quickly transforms scattered text or long-form content into high-quality AI image prompts (optimized for ChatGPT / Gemini / Midjourney).
 
+Developed by (Eric PWA) PAN WEN AN
+
 ---
 
 ## 🔗 立即試用 (Try it now)

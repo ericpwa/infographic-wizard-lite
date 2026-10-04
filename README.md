@@ -2,6 +2,8 @@
 
 > **【資訊圖表咒語法師】讓資訊長文變好玩有趣的 AI 圖表工具。**
 > **Make Info easy to read & Fun! This AI tool that turns boring text into engaging visuals.**
+> 
+> 🛡️ **v2.0 正式對外發布版 (DD Robustness Release)**：支援全球 Google AI Studio BYOK 零死角容錯、非阻塞式模型雷達、四層級聯降級 (Cascade Fallback 100% 產出保證) 與一鍵下載 Markdown 提示詞檔。
 
 ### 🚀 專案簡介 (Introduction)
 社群小編與行銷人員偷偷在用，默默提早下班，卻不告訴你的密技！

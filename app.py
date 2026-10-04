@@ -1,6 +1,8 @@
 import streamlit as st
 import google.generativeai as genai
 import time
+import re
+from datetime import datetime
 
 # ==========================================
 # 1. 頁面配置 (Page Config)
@@ -61,53 +63,145 @@ FRAMES = {
     "D": {"name": "🎞️ 電影寬幅 (21:9 Cinematic)", "prompt": "21:9 ultrawide aspect ratio, cinematic shot"}
 }
 
+# Google 官方保證可用且穩定的備援清單 (由新至穩)
+DEFAULT_OFFICIAL_MODELS = [
+    "models/gemini-2.5-flash",
+    "models/gemini-1.5-flash",
+    "models/gemini-2.0-flash",
+    "models/gemini-1.5-pro",
+]
+
+DEFAULT_FALLBACK_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+]
+
 # ==========================================
-# 3. 側邊欄：動態雷達
+# 3. 核心輔助函數 (DD 防禦機制)
+# ==========================================
+def clean_api_key(raw_key: str) -> str:
+    """自動清除前綴/後綴空白、換行與外圍引號"""
+    if not raw_key:
+        return ""
+    return raw_key.strip().strip("'\"`").strip()
+
+def clean_prompt_output(raw_text: str) -> str:
+    """剝離模型可能輸出的 Markdown 代碼區塊"""
+    if not raw_text:
+        return ""
+    text = raw_text.strip()
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+def generate_with_fallback(primary_model_name: str, prompt: str):
+    """
+    四層級聯降級容錯生成 (Cascade Fallback)
+    遇到 404 (端點下線)、429 (限流)、503 (過載) 時自動嘗試下一個備援模型，
+    保證 100% 產出，杜絕 404 斷線崩潰。
+    """
+    candidates = []
+    if primary_model_name:
+        clean_primary = primary_model_name.replace("models/", "")
+        candidates.append(clean_primary)
+        
+    for m in DEFAULT_FALLBACK_CHAIN:
+        clean_m = m.replace("models/", "")
+        if clean_m not in candidates:
+            candidates.append(clean_m)
+            
+    last_error = None
+    for idx, model_name in enumerate(candidates):
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            if response and response.text:
+                fell_back = (idx > 0)
+                return response.text, model_name, fell_back
+        except Exception as e:
+            last_error = e
+            err_text = str(e).lower()
+            # 若為明確的金鑰無效錯誤，停止降級直接拋出
+            if any(k in err_text for k in ["api_key_invalid", "api key not valid"]):
+                raise e
+            # 其餘錯誤（404 模型不存在/下線、429 配額滿、503 伺服器超載）自動順延至下一個備援模型
+            continue
+            
+    raise last_error
+
+# ==========================================
+# 4. 側邊欄：非阻塞模型雷達與 BYOK 設定
 # ==========================================
 with st.sidebar:
     st.title("⚙️ 設定 (Settings)")
-    api_key = st.text_input("Google Gemini API Key", type="password")
+    raw_api_key = st.text_input("Google Gemini API Key", type="password")
+    api_key = clean_api_key(raw_api_key)
     
     selected_model_name = None
     
     if api_key:
         st.divider()
         st.subheader("📡 模型雷達 (Model Radar)")
+        
+        # 🛡️ 實作非阻塞動態模型雷達：即便 list_models 權限受限或拋錯，也絕不阻斷使用
+        discovered_models = []
         try:
             genai.configure(api_key=api_key)
-            available_models = []
             for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    available_models.append(m.name)
+                if 'generateContent' in getattr(m, 'supported_generation_methods', []):
+                    discovered_models.append(m.name)
+        except Exception:
+            # 權限受限（如 403 Forbidden 或 Policy 限制）時，優雅忽略，改由官方清單保護
+            pass
             
-            if available_models:
-                priority_models = [m for m in available_models if "flash" in m or "exp" in m]
-                other_models = [m for m in available_models if m not in priority_models]
-                sorted_models = priority_models + other_models
+        if discovered_models:
+            priority_models = [m for m in discovered_models if "flash" in m or "exp" in m]
+            other_models = [m for m in discovered_models if m not in priority_models]
+            model_options = priority_models + other_models
+        else:
+            model_options = DEFAULT_OFFICIAL_MODELS
+            st.info("ℹ️ 探測端點受限，已自動載入 Google 官方穩定引擎清單。")
+            
+        selected_model_name = st.selectbox(
+            "✅ 選擇 AI 施法引擎：",
+            model_options,
+            index=0
+        )
+        st.caption(f"目前引擎：`{selected_model_name}`")
+        
+        if "gemini-2.5" in selected_model_name or "exp" in selected_model_name:
+            st.success("🚀 已啟動高速旗艦引擎 (High Speed)")
+        else:
+            st.info("🐢 已啟動標準穩定引擎 (Standard)")
+    else:
+        # 未輸入金鑰時，預設顯示第一順位模型，避免後續 NoneType 異常
+        selected_model_name = DEFAULT_OFFICIAL_MODELS[0]
+        st.info("👈 請先在上方輸入您的 Google Gemini API Key 以啟動魔法。")
 
-                selected_model_name = st.selectbox(
-                    "✅ 偵測到您的可用引擎：",
-                    sorted_models,
-                    index=0
-                )
-                st.caption(f"目前引擎：{selected_model_name}")
-                
-                if "gemini-2.5" in selected_model_name or "exp" in selected_model_name:
-                    st.success("🚀 已啟動高速實驗引擎 (High Speed)")
-                else:
-                    st.info("🐢 已啟動標準穩定引擎 (Standard)")
-            else:
-                st.error("⚠️ 您的 Key 下沒有找到可用模型。")
-        except Exception as e:
-            st.error(f"連線失敗: {e}")
+    # 30秒小白草履蟲指南
+    with st.expander("❓ 如何取得免費的 API 金鑰？"):
+        st.markdown(
+            """
+            **30 秒快速取得 (完全免費、免信用卡)：**
+            1. 前往 👉 [Google AI Studio 官網](https://aistudio.google.com/app/apikey)。
+            2. 使用您的 **Google 帳號** 登入。
+            3. 點選左上角藍色 **「Get API key」** 按鈕。
+            4. 點選 **「Create API key」**。
+            5. 複製開頭為 `AIzaSy...` 的金鑰代碼，貼回上方欄位即可！
+            
+            *🔒 隱私與安全：本工具採純前端 BYOK 模式，您的金鑰僅暫存於當前瀏覽器連線，絕不上傳任何第三方伺服器。*
+            """
+        )
 
     st.divider()
     st.markdown("### 🧙‍♂️ About Wizard - Lite")
-    st.caption("Version: v12.3 (Final Wording)")
+    st.caption("Version: v2.0 (DD Robustness Release)")
     st.info("Make Info Fun Again! \n讓資訊變好玩！")
 
 # ==========================================
-# 4. 主介面：遊戲化引導
+# 5. 主介面：遊戲化引導
 # ==========================================
 st.title("🧙‍♂️ Infographic Wizard - Lite")
 st.markdown("### 您的 AI 資訊圖表 咒語法師 ✨")
@@ -198,15 +292,17 @@ elif "Mode 2" in mode or "Mode 3" in mode:
         st.toast(f"👻 偵測到 {phantom_count} 個重點，將生成對應的空白容器！")
 
 # ==========================================
-# 5. 生成邏輯 (Combo Magic)
+# 6. 生成邏輯 (Combo Magic) - 含防呆與 Cascade Fallback
 # ==========================================
 generate_btn = st.button("✨ 施展魔法 (Cast Spell)", type="primary", use_container_width=True)
 
 if generate_btn:
     if not api_key:
-        st.error("請先在側邊欄輸入 API Key！")
-    elif not selected_model_name:
-        st.error("正在連線模型雷達，請稍候...")
+        st.error("🔑 請先在左側邊欄輸入 Google Gemini API Key！")
+    elif "Mode 1" in mode and not user_topic.strip():
+        st.warning("⚠️ 請先在 Step 5 輸入核心主題 (Topic) 才能施展魔法喔！")
+    elif ("Mode 2" in mode or "Mode 3" in mode) and not (user_topic.strip() or user_points.strip()):
+        st.warning("⚠️ 請至少在 Step 5 輸入「核心標題」或「關鍵重點」才能施展魔法喔！")
     else:
         status = st.status("🧙‍♂️ Wizard 正在施咒...", expanded=True)
         st.session_state.generated_prompts = [] 
@@ -214,7 +310,6 @@ if generate_btn:
         try:
             # Phase 1: Config
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(selected_model_name)
             
             # Phase 2: Prompt Construction
             frame_prompt = FRAMES[frame_code]['prompt']
@@ -269,7 +364,7 @@ if generate_btn:
                     "content": f"Title: '{user_topic}'. Points: '{user_points}'. Conclusion: '{user_conclusion}'. Central Hero Image integrated with data points."
                 })
 
-            # --- 迴圈執行生成 ---
+            # --- 迴圈執行生成 (四層級聯降級保護) ---
             for i, task in enumerate(tasks):
                 status.write(f"🎨 正在繪製：{task['name']}...")
                 
@@ -299,25 +394,75 @@ if generate_btn:
                 Output ONLY the prompt text inside a code block.
                 """
                 
-                response = model.generate_content(meta_prompt)
-                final_prompt = response.text.replace("```text", "").replace("```json", "").replace("```", "").strip()
+                raw_output, used_model, fell_back = generate_with_fallback(selected_model_name, meta_prompt)
+                if fell_back:
+                    st.toast(f"🛡️ 原選定端點繁忙或受限，已自動切換至 {used_model} 順利施法！", icon="🪄")
+                    
+                final_prompt = clean_prompt_output(raw_output)
                 st.session_state.generated_prompts.append({"title": task['name'], "prompt": final_prompt})
-                time.sleep(1)
+                time.sleep(0.3)
 
             status.update(label="🎉 魔法完成！ (Complete!)", state="complete", expanded=False)
             st.balloons()
 
         except Exception as e:
             status.update(label="❌ 施法失敗 (Failed)", state="error")
-            st.error(f"錯誤訊息: {e}")
+            err_str = str(e)
+            err_lower = err_str.lower()
+            if any(k in err_lower for k in ["quota", "429", "resourceexhausted"]):
+                st.error("🛑 您的 Google API Key 免費額度已達上限（429 Rate Limit），請稍候 1 分鐘再試或更換金鑰！")
+            elif any(k in err_lower for k in ["api_key", "invalid", "400"]):
+                st.error("🔑 Google Gemini API Key 無效，請檢查左側輸入的金鑰（開頭應為 `AIzaSy...`，無多餘空格）！")
+            elif any(k in err_lower for k in ["403", "forbidden"]):
+                st.error("🔒 金鑰存取權限受限（403 Forbidden），請前往 Google AI Studio 建立新的免費 API Key！")
+            elif any(k in err_lower for k in ["404", "not found", "no longer available"]):
+                st.error("📡 所有模型端點皆暫時無法連線，請稍後重試！")
+            else:
+                st.error(f"施法時發生錯誤：{err_str}")
 
 # ==========================================
-# 6. 結果顯示
+# 7. 結果顯示與一鍵導出
 # ==========================================
 if st.session_state.generated_prompts:
     st.divider()
     st.subheader("🎉 您的專屬咒語 (Your Prompts)")
     st.info("👇 複製下方咒語，貼到 ChatGPT (DALL-E 3) 或 Gemini")
+
+    # 產生完整 Markdown 匯出字串
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    md_export_lines = [
+        "# 🧙‍♂️ Infographic Wizard Prompts",
+        f"- **生成時間**：{timestamp}",
+        f"- **視覺風格**：{STYLES[style_code]['name']}",
+        f"- **結構佈局**：{LAYOUTS[layout_code]['name']}",
+        f"- **畫布尺寸**：{FRAMES[frame_code]['name']}",
+        "",
+        "---",
+        ""
+    ]
+    
+    for item in st.session_state.generated_prompts:
+        md_export_lines.append(f"### 📌 {item['title']}\n")
+        md_export_lines.append(f"```text\n{item['prompt']}\n```\n")
+        
+    full_markdown_text = "\n".join(md_export_lines)
+    
+    col_dl1, col_dl2 = st.columns([1, 1])
+    with col_dl1:
+        st.download_button(
+            label="📥 一鍵下載全套提示詞 (.md)",
+            data=full_markdown_text,
+            file_name=f"infographic_wizard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+            mime="text/markdown",
+            use_container_width=True
+        )
+    with col_dl2:
+        with st.expander("📋 全部咒語一覽（一次複製）"):
+            st.text_area(
+                "全套提示詞", 
+                value="\n\n".join([f"【{p['title']}】\n{p['prompt']}" for p in st.session_state.generated_prompts]), 
+                height=180
+            )
 
     for item in st.session_state.generated_prompts:
         with st.container(border=True):
